@@ -84,7 +84,62 @@ for handler in logger.handlers:
             ColorizedFormatter("%(asctime)s - %(levelname)s - %(message)s")
         )
 
+# Also persist WARNING+ logs (errors, retries, 422s) to a file so failures can be
+# inspected after the fact — even when the server runs quietly (log_level="error")
+# or in the background. Path is overridable via PROXY_LOG_FILE.
+try:
+    _proxy_log_path = os.environ.get("PROXY_LOG_FILE", "proxy_errors.log")
+    _file_handler = logging.FileHandler(_proxy_log_path)
+    _file_handler.setLevel(logging.WARNING)
+    _file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    )
+    _file_handler.addFilter(MessageFilter())
+    logging.getLogger().addHandler(_file_handler)
+    logger.warning(f"Proxy diagnostic log enabled at: {_proxy_log_path}")
+except Exception as _log_setup_err:  # pragma: no cover
+    logger.warning(f"Could not set up file logging: {_log_setup_err}")
+
 app = FastAPI()
+
+
+# Log (and Anthropic-format) request validation failures. FastAPI returns 422
+# *before* the endpoint runs, so these never appear in the normal request logs —
+# which makes silent 422s look like the model being "temporarily unavailable" in
+# Claude Code. This surfaces exactly which field/block was rejected.
+from fastapi.exceptions import RequestValidationError  # noqa: E402
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    try:
+        errors = exc.errors()
+        # Trim verbose 'input' payloads so the log stays readable.
+        brief = []
+        for err in errors:
+            brief.append(
+                {
+                    "loc": err.get("loc"),
+                    "type": err.get("type"),
+                    "msg": err.get("msg"),
+                }
+            )
+        logger.error(
+            f"⛔ 422 validation error on {request.method} {request.url.path}: "
+            f"{json.dumps(brief)}"
+        )
+    except Exception as log_err:
+        logger.error(f"422 validation error (failed to format details): {log_err}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Request validation failed; see proxy logs for details.",
+            },
+        },
+    )
 
 # Get API keys from environment
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -106,8 +161,32 @@ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
 
 # Get model mapping configuration from environment
 # Default to latest OpenAI models if not set
+# Tier mapping (Anthropic model family -> backend model):
+#   opus   -> BIG_MODEL    (highest tier, e.g. fugu-ultra)
+#   sonnet -> SMALL_MODEL  (mid/daily-driver tier, e.g. fugu)
+#   haiku  -> HAIKU_MODEL  (low tier; defaults to a free Gemini model)
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
+# Low-tier model used for Haiku. Defaults to Google's free Gemini Flash, which
+# is the closest free analog to Claude Haiku. Requires GEMINI_API_KEY when a
+# gemini-* model is used.
+HAIKU_MODEL = os.environ.get("HAIKU_MODEL", "gemini-2.5-flash")
+
+# --- Exa AI web search configuration ---------------------------------------
+# The backend (e.g. api.sakana.ai) cannot run Anthropic's server-side web
+# search, so this proxy executes the search itself using Exa AI and feeds the
+# results back to the model. Set EXA_API_KEY to enable it.
+EXA_API_KEY = os.environ.get("EXA_API_KEY")
+EXA_SEARCH_URL = os.environ.get("EXA_SEARCH_URL", "https://api.exa.ai/search")
+EXA_NUM_RESULTS = int(os.environ.get("EXA_NUM_RESULTS", "5"))
+EXA_TEXT_MAX_CHARS = int(os.environ.get("EXA_TEXT_MAX_CHARS", "2000"))
+# Safety cap on how many web-search round-trips a single request may trigger.
+WEB_SEARCH_MAX_USES = int(os.environ.get("WEB_SEARCH_MAX_USES", "5"))
+
+# Canonical function name the proxy exposes to the backend for web search, plus
+# the set of names/types that identify an incoming Anthropic web-search tool.
+WEB_SEARCH_FUNCTION_NAME = "web_search"
+WEB_SEARCH_TOOL_NAMES = {"web_search", "websearch"}
 
 # List of OpenAI models
 OPENAI_MODELS = [
@@ -126,7 +205,77 @@ OPENAI_MODELS = [
 ]
 
 # List of Gemini models
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+GEMINI_MODELS = [
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
+
+
+def _provider_prefix_for(model_name: str) -> str:
+    """Attach the correct LiteLLM provider prefix for a bare backend model name."""
+    if model_name.startswith(("openai/", "gemini/", "anthropic/")):
+        return model_name
+    if model_name in GEMINI_MODELS:
+        return f"gemini/{model_name}"
+    # Everything else (incl. Sakana fugu/fugu-ultra) goes through the OpenAI path.
+    return f"openai/{model_name}"
+
+
+def response_model_name(original_request) -> str:
+    """The model name to report back to the client.
+
+    Prefer the original Claude name the client sent (e.g. "claude-sonnet-4-6")
+    over the mapped backend name (e.g. "openai/fugu"), so the mapped name does
+    not leak back into the client's later requests (count_tokens, etc.).
+    """
+    original = getattr(original_request, "original_model", None)
+    if original and original != "unknown":
+        return original
+    return original_request.model
+
+
+def map_anthropic_model(v: str):
+    """Map an incoming Anthropic model name to a backend model + provider prefix.
+
+    Tiering:
+      haiku  -> HAIKU_MODEL  (low tier, free)
+      sonnet -> SMALL_MODEL  (mid tier)
+      opus   -> BIG_MODEL    (high tier)
+    Returns (new_model, mapped: bool).
+    """
+    # Strip any existing provider prefix for matching.
+    clean_v = v
+    if clean_v.startswith("anthropic/"):
+        clean_v = clean_v[10:]
+    elif clean_v.startswith("openai/"):
+        clean_v = clean_v[7:]
+    elif clean_v.startswith("gemini/"):
+        clean_v = clean_v[7:]
+
+    # "Just an Anthropic proxy" mode: keep the model, only add the prefix.
+    if PREFERRED_PROVIDER == "anthropic":
+        return f"anthropic/{clean_v}", True
+
+    low = clean_v.lower()
+    if "haiku" in low:
+        return _provider_prefix_for(HAIKU_MODEL), True
+    if "sonnet" in low:
+        return _provider_prefix_for(SMALL_MODEL), True
+    if "opus" in low:
+        return _provider_prefix_for(BIG_MODEL), True
+
+    # Not a tiered Claude name: add a prefix if it's a known backend model.
+    if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
+        return f"gemini/{clean_v}", True
+    if clean_v in OPENAI_MODELS and not v.startswith("openai/"):
+        return f"openai/{clean_v}", True
+
+    return v, False
 
 
 # Helper function to clean schema for Gemini
@@ -181,6 +330,19 @@ class ContentBlockToolResult(BaseModel):
     content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any]
 
 
+class ContentBlockServerToolUse(BaseModel):
+    type: Literal["server_tool_use"]
+    id: str
+    name: str
+    input: Dict[str, Any]
+
+
+class ContentBlockWebSearchToolResult(BaseModel):
+    type: Literal["web_search_tool_result"]
+    tool_use_id: str
+    content: Union[List[Dict[str, Any]], Dict[str, Any]]
+
+
 class SystemContent(BaseModel):
     type: Literal["text"]
     text: str
@@ -196,15 +358,77 @@ class Message(BaseModel):
                 ContentBlockImage,
                 ContentBlockToolUse,
                 ContentBlockToolResult,
+                ContentBlockServerToolUse,
+                ContentBlockWebSearchToolResult,
             ]
         ],
     ]
+
+    @field_validator("content", mode="before")
+    def _normalize_content_blocks(cls, v):
+        """Tolerate content block types the proxy doesn't explicitly model.
+
+        Claude Code replays full history on every request — including blocks the
+        proxy has no schema for (e.g. ``thinking`` / ``redacted_thinking`` from
+        extended thinking, ``document``, etc.). Without this, those blocks make
+        Pydantic reject the whole request with 422, which Claude Code surfaces as
+        the model being "temporarily unavailable" (notably for the auto-mode
+        safety classifier). We drop reasoning blocks and coerce other unknown
+        blocks to text so validation always succeeds.
+        """
+        if not isinstance(v, list):
+            return v
+        known = {
+            "text",
+            "image",
+            "tool_use",
+            "tool_result",
+            "server_tool_use",
+            "web_search_tool_result",
+        }
+        cleaned = []
+        for item in v:
+            if not isinstance(item, dict):
+                # Already a validated block model (e.g. from count_tokens reuse).
+                cleaned.append(item)
+                continue
+            t = item.get("type")
+            if t in known:
+                cleaned.append(item)
+            elif t in ("thinking", "redacted_thinking"):
+                # Reasoning blocks are not forwarded to non-Anthropic backends.
+                continue
+            else:
+                # Unknown block: keep any text so context isn't lost; else drop.
+                text = item.get("text")
+                if not isinstance(text, str):
+                    inner = item.get("content")
+                    text = inner if isinstance(inner, str) else None
+                if isinstance(text, str) and text:
+                    cleaned.append({"type": "text", "text": text})
+        return cleaned
 
 
 class Tool(BaseModel):
     name: str
     description: Optional[str] = None
-    input_schema: Dict[str, Any]
+    # input_schema is required for normal (client-side) function tools, but
+    # Anthropic server tools such as web search are sent WITHOUT it, e.g.
+    #   {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+    # so we make it optional and tolerate the extra server-tool fields.
+    input_schema: Optional[Dict[str, Any]] = None
+    type: Optional[str] = None
+    max_uses: Optional[int] = None
+    allowed_domains: Optional[List[str]] = None
+    blocked_domains: Optional[List[str]] = None
+    user_location: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "allow"}
+
+    def is_web_search(self) -> bool:
+        return is_web_search_tool_dict(
+            self.dict() if hasattr(self, "dict") else dict(self)
+        )
 
 
 class ThinkingConfig(BaseModel):
@@ -239,55 +463,13 @@ class MessagesRequest(BaseModel):
     @field_validator("model")
     def validate_model_field(cls, v, info):  # Renamed to avoid conflict
         original_model = v
-        new_model = v  # Default to original value
 
         logger.debug(
-            f"📋 MODEL VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'"
+            f"📋 MODEL VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', "
+            f"OPUS/BIG='{BIG_MODEL}', SONNET/SMALL='{SMALL_MODEL}', HAIKU='{HAIKU_MODEL}'"
         )
 
-        # Remove provider prefixes for easier matching
-        clean_v = v
-        if clean_v.startswith("anthropic/"):
-            clean_v = clean_v[10:]
-        elif clean_v.startswith("openai/"):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith("gemini/"):
-            clean_v = clean_v[7:]
-
-        # --- Mapping Logic --- START ---
-        mapped = False
-        if PREFERRED_PROVIDER == "anthropic":
-            # Don't remap to big/small models, just add the prefix
-            new_model = f"anthropic/{clean_v}"
-            mapped = True
-
-        # Map Haiku to SMALL_MODEL based on provider preference
-        elif "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{SMALL_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
-
-        # Map Sonnet to BIG_MODEL based on provider preference
-        elif "sonnet" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-                mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
-        elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
-                new_model = f"gemini/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
-            elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-                new_model = f"openai/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
-        # --- Mapping Logic --- END ---
+        new_model, mapped = map_anthropic_model(v)
 
         if mapped:
             logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}'")
@@ -318,54 +500,15 @@ class TokenCountRequest(BaseModel):
 
     @field_validator("model")
     def validate_model_token_count(cls, v, info):  # Renamed to avoid conflict
-        # Use the same logic as MessagesRequest validator
-        # NOTE: Pydantic validators might not share state easily if not class methods
-        # Re-implementing the logic here for clarity, could be refactored
+        # Shares the same tiering logic as MessagesRequest.
         original_model = v
-        new_model = v  # Default to original value
 
         logger.debug(
-            f"📋 TOKEN COUNT VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'"
+            f"📋 TOKEN COUNT VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', "
+            f"OPUS/BIG='{BIG_MODEL}', SONNET/SMALL='{SMALL_MODEL}', HAIKU='{HAIKU_MODEL}'"
         )
 
-        # Remove provider prefixes for easier matching
-        clean_v = v
-        if clean_v.startswith("anthropic/"):
-            clean_v = clean_v[10:]
-        elif clean_v.startswith("openai/"):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith("gemini/"):
-            clean_v = clean_v[7:]
-
-        # --- Mapping Logic --- START ---
-        mapped = False
-        # Map Haiku to SMALL_MODEL based on provider preference
-        if "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{SMALL_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
-
-        # Map Sonnet to BIG_MODEL based on provider preference
-        elif "sonnet" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-                mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
-        elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
-                new_model = f"gemini/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
-            elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-                new_model = f"openai/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
-        # --- Mapping Logic --- END ---
+        new_model, mapped = map_anthropic_model(v)
 
         if mapped:
             logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}' ➡️ '{new_model}'")
@@ -399,7 +542,14 @@ class MessagesResponse(BaseModel):
     id: str
     model: str
     role: Literal["assistant"] = "assistant"
-    content: List[Union[ContentBlockText, ContentBlockToolUse]]
+    content: List[
+        Union[
+            ContentBlockText,
+            ContentBlockToolUse,
+            ContentBlockServerToolUse,
+            ContentBlockWebSearchToolResult,
+        ]
+    ]
     type: Literal["message"] = "message"
     stop_reason: Optional[
         Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
@@ -414,11 +564,18 @@ async def log_requests(request: Request, call_next):
     method = request.method
     path = request.url.path
 
-    # Log only basic request details at debug level
-    logger.debug(f"Request: {method} {path}")
-
     # Process the request and get the response
     response = await call_next(request)
+
+    # Log EVERY request (method, path, status) to the diagnostic file so we can
+    # see endpoints the proxy doesn't implement (404s) or unexpected statuses —
+    # these never reach the per-endpoint handlers and are otherwise invisible.
+    # Logged at WARNING so it always reaches proxy_errors.log during diagnosis.
+    try:
+        status = getattr(response, "status_code", "?")
+        logger.warning(f"REQ {method} {path} -> {status}")
+    except Exception:
+        pass
 
     return response
 
@@ -426,19 +583,65 @@ async def log_requests(request: Request, call_next):
 # Not using validation function as we're using the environment API key
 
 
-async def retry_with_backoff(coro_func, max_retries: int = 3, base_delay: float = 1.0):
-    """Retry an async coroutine with exponential backoff on transient 502/504 errors."""
-    retryable_status = {502, 504}
+# Transient upstream conditions worth retrying. These commonly cause Claude
+# Code to report a model as "temporarily unavailable" (e.g. the auto-mode
+# safety classifier failing before an Edit).
+RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+RETRYABLE_EXCEPTION_NAMES = {
+    "RateLimitError",
+    "Timeout",
+    "APITimeoutError",
+    "APIConnectionError",
+    "ServiceUnavailableError",
+    "InternalServerError",
+    "OverloadedError",
+}
+
+
+def _is_retryable_error(e: Exception) -> bool:
+    """Decide whether an upstream exception is a transient error worth retrying."""
+    status = getattr(e, "status_code", None)
+    if status in RETRYABLE_STATUS_CODES:
+        return True
+    if type(e).__name__ in RETRYABLE_EXCEPTION_NAMES:
+        return True
+    # Some connection/timeout errors carry no status_code and a generic type;
+    # fall back to a conservative message sniff.
+    msg = str(e).lower()
+    transient_markers = (
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "connection error",
+        "temporarily unavailable",
+        "overloaded",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+    )
+    return any(marker in msg for marker in transient_markers)
+
+
+async def retry_with_backoff(coro_func, max_retries: int = 4, base_delay: float = 1.0):
+    """Retry an async coroutine with exponential backoff + jitter on transient errors.
+
+    Covers HTTP 408/409/425/429/500/502/503/504/529 plus rate-limit, timeout and
+    connection errors — the failure modes that otherwise surface to the client as
+    "temporarily unavailable".
+    """
+    import random
+
     for attempt in range(max_retries):
         try:
             return await coro_func()
         except Exception as e:
-            status = getattr(e, "status_code", None)
-            if status in retryable_status and attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
+            if _is_retryable_error(e) and attempt < max_retries - 1:
+                status = getattr(e, "status_code", None) or type(e).__name__
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
                 logger.warning(
-                    f"Upstream {status} error (attempt {attempt + 1}/{max_retries}), "
-                    f"retrying in {delay:.1f}s..."
+                    f"Transient upstream error [{status}] "
+                    f"(attempt {attempt + 1}/{max_retries}), retrying in {delay:.1f}s..."
                 )
                 await asyncio.sleep(delay)
             else:
@@ -527,6 +730,184 @@ def parse_tool_result_content(content):
         return str(content)
     except:
         return "Unparseable content"
+
+
+# ---------------------------------------------------------------------------
+# Web search (Exa AI) support
+# ---------------------------------------------------------------------------
+def is_web_search_tool_dict(tool_dict: Dict[str, Any]) -> bool:
+    """Return True if an Anthropic tool definition represents web search.
+
+    Matches both the native server-tool shape
+    ({"type": "web_search_20250305", "name": "web_search"}) and a plain
+    function tool that happens to be named web_search / WebSearch.
+    """
+    if not isinstance(tool_dict, dict):
+        return False
+    t = tool_dict.get("type")
+    if isinstance(t, str) and t.startswith("web_search"):
+        return True
+    name = tool_dict.get("name")
+    if isinstance(name, str) and name.lower() in WEB_SEARCH_TOOL_NAMES:
+        return True
+    return False
+
+
+# JSON schema advertised to the backend for the web_search function tool.
+WEB_SEARCH_PARAMETERS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "The search query to look up on the web.",
+        }
+    },
+    "required": ["query"],
+}
+
+
+def exa_search(
+    query: str,
+    num_results: int = EXA_NUM_RESULTS,
+    allowed_domains: Optional[List[str]] = None,
+    blocked_domains: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Run a web search via the Exa AI API.
+
+    Returns a dict: {"results": [ {title, url, published_date, snippet} ], "error": Optional[str]}.
+    """
+    if not EXA_API_KEY:
+        return {
+            "results": [],
+            "error": "Web search is not configured: EXA_API_KEY is not set on the proxy.",
+        }
+
+    payload: Dict[str, Any] = {
+        "query": query,
+        "type": "auto",
+        "numResults": max(1, int(num_results or EXA_NUM_RESULTS)),
+        "contents": {
+            "text": {"maxCharacters": EXA_TEXT_MAX_CHARS},
+            "highlights": {"numSentences": 3, "highlightsPerUrl": 2},
+        },
+    }
+    if allowed_domains:
+        payload["includeDomains"] = allowed_domains
+    if blocked_domains:
+        payload["excludeDomains"] = blocked_domains
+
+    headers = {
+        "x-api-key": EXA_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(EXA_SEARCH_URL, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as e:
+        body = ""
+        try:
+            body = e.response.text[:500]
+        except Exception:
+            pass
+        logger.error(f"Exa search HTTP error {e.response.status_code}: {body}")
+        return {"results": [], "error": f"Exa search failed: HTTP {e.response.status_code}"}
+    except Exception as e:
+        logger.error(f"Exa search error: {e}")
+        return {"results": [], "error": f"Exa search failed: {e}"}
+
+    results = []
+    for item in data.get("results", []) or []:
+        snippet = ""
+        highlights = item.get("highlights") or []
+        if highlights:
+            snippet = " … ".join(h for h in highlights if h)
+        if not snippet:
+            text = item.get("text") or ""
+            snippet = text[:EXA_TEXT_MAX_CHARS]
+        results.append(
+            {
+                "title": item.get("title") or item.get("url") or "Untitled",
+                "url": item.get("url", ""),
+                "published_date": item.get("publishedDate") or item.get("published_date"),
+                "author": item.get("author"),
+                "snippet": snippet.strip(),
+            }
+        )
+    return {"results": results, "error": None}
+
+
+def format_search_results_for_model(query: str, search: Dict[str, Any]) -> str:
+    """Build a compact, model-friendly string from Exa results."""
+    if search.get("error"):
+        return f"Web search for '{query}' failed: {search['error']}"
+    results = search.get("results", [])
+    if not results:
+        return f"Web search for '{query}' returned no results."
+
+    lines = [f"Search results for: {query}", ""]
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r.get('title')}")
+        lines.append(f"URL: {r.get('url')}")
+        if r.get("published_date"):
+            lines.append(f"Published: {r.get('published_date')}")
+        if r.get("snippet"):
+            lines.append(f"Snippet: {r.get('snippet')}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def build_web_search_result_block(tool_id: str, search: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a single Anthropic web_search_tool_result block from an Exa result."""
+    import base64
+
+    if search.get("error"):
+        return {
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_id,
+            "content": {
+                "type": "web_search_tool_result_error",
+                "error_code": "unavailable",
+            },
+        }
+    result_items = []
+    for r in search.get("results", []):
+        snippet = r.get("snippet") or ""
+        encrypted = base64.b64encode(snippet.encode("utf-8")).decode("ascii")
+        result_items.append(
+            {
+                "type": "web_search_result",
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "encrypted_content": encrypted,
+                "page_age": r.get("published_date"),
+            }
+        )
+    return {
+        "type": "web_search_tool_result",
+        "tool_use_id": tool_id,
+        "content": result_items,
+    }
+
+
+def build_web_search_result_blocks(search_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert recorded searches into Anthropic server_tool_use + web_search_tool_result blocks."""
+    blocks: List[Dict[str, Any]] = []
+    for rec in search_records:
+        query = rec.get("query", "")
+        tool_id = rec.get("tool_use_id") or f"srvtoolu_{uuid.uuid4().hex[:24]}"
+        blocks.append(
+            {
+                "type": "server_tool_use",
+                "id": tool_id,
+                "name": "web_search",
+                "input": {"query": query},
+            }
+        )
+        blocks.append(build_web_search_result_block(tool_id, rec.get("search", {})))
+    return blocks
 
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
@@ -659,6 +1040,39 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
                             processed_content.append(processed_content_block)
 
+                        elif block.type == "server_tool_use":
+                            # Web search request the proxy executed on a prior turn.
+                            # Echoed back by the client as history; flatten to text.
+                            inp = getattr(block, "input", {}) or {}
+                            query = (
+                                inp.get("query", "") if isinstance(inp, dict) else ""
+                            )
+                            processed_content.append(
+                                {
+                                    "type": "text",
+                                    "text": f"[Web search performed: {query}]",
+                                }
+                            )
+
+                        elif block.type == "web_search_tool_result":
+                            # Results of a prior proxy web search, echoed back as
+                            # history. Flatten to a short text summary so the model
+                            # retains the context without the opaque encrypted blob.
+                            rc = getattr(block, "content", None)
+                            lines = ["[Web search results]"]
+                            if isinstance(rc, list):
+                                for item in rc:
+                                    if (
+                                        isinstance(item, dict)
+                                        and item.get("type") == "web_search_result"
+                                    ):
+                                        title = item.get("title", "")
+                                        url = item.get("url", "")
+                                        lines.append(f"- {title} ({url})")
+                            processed_content.append(
+                                {"type": "text", "text": "\n".join(lines)}
+                            )
+
                 if openai_tool_calls and msg.role == "assistant":
                     # Emit an assistant message with tool_calls in OpenAI format.
                     text_parts = [
@@ -685,6 +1099,14 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         logger.debug(
             f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})"
         )
+
+    # OpenAI-compatible endpoints (e.g. Sakana AI) reject max_completion_tokens < 16.
+    # Claude Code sends tiny probe requests (max_tokens=1) for Haiku, so enforce a floor.
+    if max_tokens < 16:
+        logger.debug(
+            f"Raising max_tokens to minimum of 16 (original value: {max_tokens})"
+        )
+        max_tokens = 16
 
     # Create LiteLLM request dict
     litellm_request = {
@@ -741,6 +1163,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.tools:
         openai_tools = []
         is_gemini_model = anthropic_request.model.startswith("gemini/")
+        seen_web_search = False
 
         for tool in anthropic_request.tools:
             # Convert to dict if it's a pydantic model
@@ -754,8 +1177,34 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                     logger.error(f"Could not convert tool to dict: {tool}")
                     continue  # Skip this tool if conversion fails
 
+            # Web search is a server tool executed by THIS proxy (via Exa), not
+            # by the backend. Expose it to the backend as a normal function tool
+            # with a canonical name so we can intercept the call and run Exa.
+            if is_web_search_tool_dict(tool_dict):
+                if seen_web_search:
+                    continue  # avoid duplicate web_search tool definitions
+                seen_web_search = True
+                openai_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": WEB_SEARCH_FUNCTION_NAME,
+                            "description": (
+                                "Search the public web for up-to-date information. "
+                                "Returns a list of relevant results with titles, URLs "
+                                "and snippets. Use this whenever the user asks about "
+                                "current events or facts you are unsure about."
+                            ),
+                            "parameters": WEB_SEARCH_PARAMETERS_SCHEMA,
+                        },
+                    }
+                )
+                continue
+
             # Clean the schema if targeting a Gemini model
             input_schema = tool_dict.get("input_schema", {})
+            if input_schema is None:
+                input_schema = {}
             if is_gemini_model:
                 logger.debug(
                     f"Cleaning schema for Gemini tool: {tool_dict.get('name')}"
@@ -801,7 +1250,9 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
 
 def convert_litellm_to_anthropic(
-    litellm_response: Union[Dict[str, Any], Any], original_request: MessagesRequest
+    litellm_response: Union[Dict[str, Any], Any],
+    original_request: MessagesRequest,
+    search_records: Optional[List[Dict[str, Any]]] = None,
 ) -> MessagesResponse:
     """Convert LiteLLM (OpenAI format) response to Anthropic API response format."""
 
@@ -877,6 +1328,11 @@ def convert_litellm_to_anthropic(
 
         # Create content list for Anthropic format
         content = []
+
+        # Prepend web search server_tool_use + web_search_tool_result blocks so
+        # Claude Code renders the searches the proxy executed on its behalf.
+        if search_records:
+            content.extend(build_web_search_result_blocks(search_records))
 
         # Fallback: parse tool calls embedded as <tool_call> tags in text content
         # (used by models like Qwen/DeepSeek that don't emit native tool_calls)
@@ -970,7 +1426,7 @@ def convert_litellm_to_anthropic(
         # Create Anthropic-style response
         anthropic_response = MessagesResponse(
             id=response_id,
-            model=original_request.model,
+            model=response_model_name(original_request),
             role="assistant",
             content=content,
             stop_reason=stop_reason,
@@ -992,7 +1448,7 @@ def convert_litellm_to_anthropic(
         # In case of any error, create a fallback response
         return MessagesResponse(
             id=f"msg_{uuid.uuid4()}",
-            model=original_request.model,
+            model=response_model_name(original_request),
             role="assistant",
             content=[
                 {
@@ -1003,6 +1459,369 @@ def convert_litellm_to_anthropic(
             stop_reason="end_turn",
             usage=Usage(input_tokens=0, output_tokens=0),
         )
+
+
+# ---------------------------------------------------------------------------
+# In-proxy web search agentic loop
+# ---------------------------------------------------------------------------
+def _tool_call_fields(tc) -> Dict[str, Any]:
+    """Normalize an OpenAI tool_call (dict or object) into {id, name, arguments}."""
+    if isinstance(tc, dict):
+        fn = tc.get("function", {}) or {}
+        return {
+            "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+            "name": fn.get("name", "") if isinstance(fn, dict) else "",
+            "arguments": (fn.get("arguments", "") if isinstance(fn, dict) else "") or "",
+        }
+    fn = getattr(tc, "function", None)
+    return {
+        "id": getattr(tc, "id", None) or f"toolu_{uuid.uuid4().hex[:24]}",
+        "name": getattr(fn, "name", "") if fn else "",
+        "arguments": (getattr(fn, "arguments", "") if fn else "") or "",
+    }
+
+
+def _parse_tool_arguments(raw) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {"query": str(raw)}
+
+
+def run_web_search_loop_sync(
+    litellm_request: Dict[str, Any],
+    allowed_domains: Optional[List[str]] = None,
+    blocked_domains: Optional[List[str]] = None,
+):
+    """Drive the backend through web-search tool calls, executing each via Exa.
+
+    Runs synchronously (intended to be called inside a thread executor). Returns
+    a tuple of (final_litellm_response, search_records).
+    """
+    req = dict(litellm_request)
+    req["stream"] = False
+    req["num_retries"] = 2  # let LiteLLM retry transient backend errors per call
+    messages = list(req.get("messages", []))
+    req["messages"] = messages
+
+    search_records: List[Dict[str, Any]] = []
+    uses = 0
+    response = None
+
+    for _ in range(WEB_SEARCH_MAX_USES + 1):
+        response = litellm.completion(**req)
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            break
+        message = choices[0].message
+        tool_calls = getattr(message, "tool_calls", None) or []
+
+        web_calls = []
+        for tc in tool_calls:
+            fields = _tool_call_fields(tc)
+            if fields["name"] == WEB_SEARCH_FUNCTION_NAME:
+                web_calls.append(fields)
+
+        # No web search requested (or budget exhausted) -> this is the final answer.
+        if not web_calls or uses >= WEB_SEARCH_MAX_USES:
+            break
+
+        # Append an assistant turn containing ONLY the web_search tool calls so
+        # every tool_call_id we answer has a matching tool message (OpenAI rule).
+        assistant_msg: Dict[str, Any] = {
+            "role": "assistant",
+            "content": getattr(message, "content", None) or "",
+            "tool_calls": [
+                {
+                    "id": c["id"],
+                    "type": "function",
+                    "function": {
+                        "name": WEB_SEARCH_FUNCTION_NAME,
+                        "arguments": c["arguments"]
+                        if isinstance(c["arguments"], str)
+                        else json.dumps(c["arguments"]),
+                    },
+                }
+                for c in web_calls
+            ],
+        }
+        messages.append(assistant_msg)
+
+        for c in web_calls:
+            args = _parse_tool_arguments(c["arguments"])
+            query = args.get("query") or args.get("q") or ""
+            logger.debug(f"🔎 Executing Exa web search: {query!r}")
+            search = exa_search(
+                query,
+                allowed_domains=allowed_domains,
+                blocked_domains=blocked_domains,
+            )
+            uses += 1
+            search_records.append(
+                {"tool_use_id": c["id"], "query": query, "search": search}
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": c["id"],
+                    "name": WEB_SEARCH_FUNCTION_NAME,
+                    "content": format_search_results_for_model(query, search),
+                }
+            )
+
+    return response, search_records
+
+
+async def synthesize_streaming_response(
+    anthropic_response: MessagesResponse, original_request: MessagesRequest
+):
+    """Emit Anthropic SSE events from an already-computed MessagesResponse.
+
+    Used for the web-search path, where the final answer is produced via a
+    (non-streaming) agentic loop but the client requested a stream.
+    """
+    message_id = anthropic_response.id or f"msg_{uuid.uuid4().hex[:24]}"
+
+    message_data = {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": response_model_name(original_request),
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": anthropic_response.usage.input_tokens,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+            },
+        },
+    }
+    yield f"event: message_start\ndata: {json.dumps(message_data)}\n\n"
+    yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
+
+    # Normalize content blocks to plain dicts
+    blocks = []
+    for block in anthropic_response.content:
+        if hasattr(block, "dict"):
+            blocks.append(block.dict())
+        elif isinstance(block, dict):
+            blocks.append(block)
+
+    for index, block in enumerate(blocks):
+        btype = block.get("type")
+        if btype == "text":
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+            text = block.get("text", "") or ""
+            if text:
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index})}\n\n"
+        elif btype in ("tool_use", "server_tool_use"):
+            start_block = {
+                "type": btype,
+                "id": block.get("id"),
+                "name": block.get("name"),
+                "input": {},
+            }
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': index, 'content_block': start_block})}\n\n"
+            partial = json.dumps(block.get("input", {}))
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'input_json_delta', 'partial_json': partial}})}\n\n"
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index})}\n\n"
+        else:
+            # web_search_tool_result and any other complete block: send whole.
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': index, 'content_block': block})}\n\n"
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index})}\n\n"
+
+    usage = {"output_tokens": anthropic_response.usage.output_tokens}
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': anthropic_response.stop_reason or 'end_turn', 'stop_sequence': None}, 'usage': usage})}\n\n"
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+async def handle_streaming_web_search(
+    litellm_request: Dict[str, Any],
+    original_request: MessagesRequest,
+    allowed_domains: Optional[List[str]] = None,
+    blocked_domains: Optional[List[str]] = None,
+):
+    """Run the web-search agentic loop *inside* the SSE stream.
+
+    This emits each ``server_tool_use`` block the moment a search begins (so
+    Claude Code shows the live ``WebSearch("…")`` status), then the matching
+    ``web_search_tool_result`` block, then finally streams the answer text.
+    """
+    response_started = False
+    try:
+        loop = asyncio.get_event_loop()
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        message_data = {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": response_model_name(original_request),
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            },
+        }
+        yield f"event: message_start\ndata: {json.dumps(message_data)}\n\n"
+        yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
+        response_started = True
+
+        req = dict(litellm_request)
+        req["stream"] = False
+        req["num_retries"] = 2  # let LiteLLM retry transient backend errors per call
+        messages = list(req.get("messages", []))
+        req["messages"] = messages
+
+        idx = 0
+        uses = 0
+        output_tokens = 0
+        stop_reason = "end_turn"
+
+        for _ in range(WEB_SEARCH_MAX_USES + 1):
+            response = await loop.run_in_executor(
+                None, lambda: litellm.completion(**req)
+            )
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                break
+            message = choices[0].message
+            usage = getattr(response, "usage", None)
+            if usage is not None and getattr(usage, "completion_tokens", None):
+                output_tokens += usage.completion_tokens
+
+            tool_calls = getattr(message, "tool_calls", None) or []
+            web_calls, other_calls = [], []
+            for tc in tool_calls:
+                f = _tool_call_fields(tc)
+                (web_calls if f["name"] == WEB_SEARCH_FUNCTION_NAME else other_calls).append(f)
+
+            # ---- A web search round: emit live blocks, run Exa, loop again ----
+            if web_calls and uses < WEB_SEARCH_MAX_USES:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": getattr(message, "content", None) or "",
+                        "tool_calls": [
+                            {
+                                "id": c["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": WEB_SEARCH_FUNCTION_NAME,
+                                    "arguments": c["arguments"]
+                                    if isinstance(c["arguments"], str)
+                                    else json.dumps(c["arguments"]),
+                                },
+                            }
+                            for c in web_calls
+                        ],
+                    }
+                )
+
+                for c in web_calls:
+                    args = _parse_tool_arguments(c["arguments"])
+                    query = args.get("query") or args.get("q") or ""
+
+                    # 1) server_tool_use block -> renders WebSearch("query") live
+                    start_block = {
+                        "type": "server_tool_use",
+                        "id": c["id"],
+                        "name": "web_search",
+                        "input": {},
+                    }
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': start_block})}\n\n"
+                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps({'query': query})}})}\n\n"
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+                    idx += 1
+
+                    # 2) run the actual search
+                    logger.debug(f"🔎 [stream] Exa web search: {query!r}")
+                    search = await loop.run_in_executor(
+                        None,
+                        lambda q=query: exa_search(
+                            q,
+                            allowed_domains=allowed_domains,
+                            blocked_domains=blocked_domains,
+                        ),
+                    )
+                    uses += 1
+
+                    # 3) web_search_tool_result block -> renders the results
+                    result_block = build_web_search_result_block(c["id"], search)
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': result_block})}\n\n"
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+                    idx += 1
+
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": c["id"],
+                            "name": WEB_SEARCH_FUNCTION_NAME,
+                            "content": format_search_results_for_model(query, search),
+                        }
+                    )
+                continue
+
+            # ---- Final answer: stream the text and any client-side tool calls ----
+            text = getattr(message, "content", None) or ""
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+            if text:
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+            idx += 1
+
+            for c in other_calls:
+                tu_block = {
+                    "type": "tool_use",
+                    "id": c["id"],
+                    "name": c["name"],
+                    "input": {},
+                }
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': tu_block})}\n\n"
+                partial = c["arguments"] if isinstance(c["arguments"], str) else json.dumps(c["arguments"])
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'input_json_delta', 'partial_json': partial}})}\n\n"
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+                idx += 1
+            if other_calls:
+                stop_reason = "tool_use"
+            break
+
+        usage = {"output_tokens": output_tokens}
+        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n"
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    except Exception as e:
+        import traceback
+
+        logger.error(f"Error in streaming web search: {e}\n{traceback.format_exc()}")
+        if response_started:
+            error_event = {
+                "type": "error",
+                "error": {"type": "server_error", "message": str(e)},
+            }
+            yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
+            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+            yield "data: [DONE]\n\n"
+        else:
+            raise
 
 
 async def handle_streaming(response_generator, original_request: MessagesRequest):
@@ -1018,7 +1837,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 "id": message_id,
                 "type": "message",
                 "role": "assistant",
-                "model": original_request.model,
+                "model": response_model_name(original_request),
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
@@ -1314,6 +2133,12 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         body_json = json.loads(body.decode("utf-8"))
         original_model = body_json.get("model", "unknown")
 
+        # Preserve the exact model name the client requested so responses echo it
+        # back (e.g. "claude-sonnet-4-6") instead of the mapped backend name
+        # ("openai/fugu"). The model validator does not persist original_model.
+        if original_model and original_model != "unknown":
+            request.original_model = original_model
+
         # Get the display name for logging, just the model name without provider prefix
         display_model = original_model
         if "/" in display_model:
@@ -1568,6 +2393,62 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}"
         )
 
+        # --- Web search path -------------------------------------------------
+        # If the client requested Anthropic's web_search tool, run it ourselves
+        # via Exa (the backend cannot perform server-side search). This drives an
+        # agentic loop, executes searches, and returns the final answer with
+        # web_search_tool_result blocks.
+        web_search_requested = bool(request.tools) and any(
+            t.is_web_search() for t in request.tools
+        )
+        if web_search_requested:
+            allowed_domains = None
+            blocked_domains = None
+            for t in request.tools:
+                if t.is_web_search():
+                    allowed_domains = getattr(t, "allowed_domains", None)
+                    blocked_domains = getattr(t, "blocked_domains", None)
+                    break
+
+            num_tools = len(request.tools) if request.tools else 0
+            log_request_beautifully(
+                "POST",
+                raw_request.url.path,
+                display_model,
+                litellm_request.get("model"),
+                len(litellm_request["messages"]),
+                num_tools,
+                200,
+            )
+
+            # Streaming: run the loop *inside* the stream so the live
+            # WebSearch("…") status renders as each search happens.
+            if request.stream:
+                return StreamingResponse(
+                    handle_streaming_web_search(
+                        litellm_request, request, allowed_domains, blocked_domains
+                    ),
+                    media_type="text/event-stream",
+                )
+
+            # Non-streaming: run the loop and return all blocks at once.
+            final_response, search_records = await retry_with_backoff(
+                lambda: asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: run_web_search_loop_sync(
+                        litellm_request, allowed_domains, blocked_domains
+                    ),
+                )
+            )
+            logger.debug(
+                f"🔎 WEB SEARCH COMPLETE: {len(search_records)} search(es) executed"
+            )
+
+            anthropic_response = convert_litellm_to_anthropic(
+                final_response, request, search_records
+            )
+            return anthropic_response
+
         # Handle streaming mode
         if request.stream:
             # Use LiteLLM for streaming
@@ -1666,6 +2547,33 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             f"Error processing request: {json.dumps(sanitized_details, indent=2)}"
         )
 
+        # Log a compact summary of the *request* that failed. This is what lets us
+        # tell a classifier/Edit failure apart from a normal one, and spot bad
+        # message structures (e.g. ends-with-assistant, empty content, huge size).
+        try:
+            roles = [m.role for m in request.messages]
+            sys_len = 0
+            if isinstance(request.system, str):
+                sys_len = len(request.system)
+            elif isinstance(request.system, list):
+                sys_len = sum(len(getattr(b, "text", "") or "") for b in request.system)
+            logger.error(
+                "Failed request shape: model=%s stream=%s max_tokens=%s "
+                "messages=%d roles=%s tools=%d tool_choice=%s system_chars=%d"
+                % (
+                    request.model,
+                    request.stream,
+                    request.max_tokens,
+                    len(request.messages),
+                    "".join("u" if r == "user" else "a" for r in roles),
+                    len(request.tools) if request.tools else 0,
+                    json.dumps(request.tool_choice) if request.tool_choice else "none",
+                    sys_len,
+                )
+            )
+        except Exception as shape_err:
+            logger.error(f"(could not log request shape: {shape_err})")
+
         # Format error for response
         error_message = f"Error: {str(e)}"
         if "message" in error_details and error_details["message"]:
@@ -1678,11 +2586,43 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         raise HTTPException(status_code=status_code, detail=error_message)
 
 
+def _approx_token_count(messages: List[Dict[str, Any]]) -> int:
+    """Rough offline token estimate (~4 chars/token) for count_tokens fallbacks.
+
+    Used when litellm.token_counter() is unavailable or raises for unknown/custom
+    models (e.g. Sakana's fugu). Claude Code only needs an approximate number.
+    """
+    total_chars = 0
+    for msg in messages or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    if isinstance(block.get("text"), str):
+                        total_chars += len(block["text"])
+                    else:
+                        total_chars += len(json.dumps(block))
+                else:
+                    total_chars += len(str(block))
+        elif content is not None:
+            total_chars += len(str(content))
+    # ~4 characters per token; never report 0 for a non-empty request.
+    return max(1, total_chars // 4)
+
+
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: TokenCountRequest, raw_request: Request):
     try:
-        # Log the incoming token count request
-        original_model = request.original_model or request.model
+        # Recover the exact model name the client sent (the validator maps
+        # request.model to the backend name and does not persist original_model).
+        try:
+            body_json = json.loads((await raw_request.body()).decode("utf-8"))
+            original_model = body_json.get("model") or request.model
+        except Exception:
+            original_model = request.original_model or request.model
+        request.original_model = original_model
 
         # Get the display name for logging, just the model name without provider prefix
         display_model = original_model
@@ -1732,10 +2672,9 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
                 "model": converted_request["model"],
                 "messages": converted_request["messages"],
             }
-
-            # Add custom base URL for OpenAI models if configured
-            if request.model.startswith("openai/") and OPENAI_BASE_URL:
-                token_counter_args["api_base"] = OPENAI_BASE_URL
+            # NOTE: litellm.token_counter() counts tokens locally (offline) and
+            # does NOT accept network args like `api_base`/`api_key`. Passing them
+            # raises `TypeError: unexpected keyword argument 'api_base'`.
 
             # Count tokens
             token_count = token_counter(**token_counter_args)
@@ -1746,7 +2685,19 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         except ImportError:
             logger.error("Could not import token_counter from litellm")
             # Fallback to a simple approximation
-            return TokenCountResponse(input_tokens=1000)  # Default fallback
+            return TokenCountResponse(
+                input_tokens=_approx_token_count(converted_request["messages"])
+            )
+        except Exception as e:
+            # token_counter can fail for unknown/custom models (e.g. fugu) or on
+            # signature mismatches across litellm versions. Don't 500 the client —
+            # Claude Code only needs a rough count, so fall back to an estimate.
+            logger.warning(
+                f"token_counter failed ({e}); using char-based approximation"
+            )
+            return TokenCountResponse(
+                input_tokens=_approx_token_count(converted_request["messages"])
+            )
 
     except Exception as e:
         import traceback
